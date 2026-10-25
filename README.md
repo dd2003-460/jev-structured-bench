@@ -34,7 +34,7 @@ This repo asks a practical engineering question: *if you can't call Jev's API, h
 
 **Conclusion: structured output costs ~3pp accuracy vs free text, and the two structured mechanisms are statistically indistinguishable (±1σ) once temperature is locked. The initially observed 23.4pp Banking77 gap was a methodology artifact.**
 
-## Erratum — two bugs found after the first run
+## Erratum — five bugs found after the first runs
 
 This is the part worth reading if you build eval harnesses.
 
@@ -62,6 +62,20 @@ The fix in `harness/jev_bench_run.py`:
 
 Mid-investigation we concluded "path B's json_schema doesn't lock its enum — it emitted lowercase letters outside the schema." That was **wrong**: the lowercase letters *are* the legal labels (Bug 2's root cause). Two controls — a single-value enum `["X"]` and a 77-value enum of full label texts — both showed B's constraint holding perfectly. The harness had lied to us twice before the mechanism did anything wrong.
 
+### Bug 3: transport failures impersonated "parse failures"
+
+The first filler-token probe reported a dramatic collapse — F0 75.0% → F1 65.0% → F2 65.0% → F3 57.5% — apparently proving that filler tokens destroy accuracy. Per-question audit: **every single "parse failure" was an HTTP 502 `upstream connect failed: connection timed out`** — transport-layer failures that occurred while two benchmarks were hitting the server concurrently and the harness's `urllib` was routing through the Mac system proxy. Restricting to questions that actually returned an answer: **F0 83.3% (30/36) → F1 81.3% (26/32) → F2 81.3% → F3 79.3% (23/29)** — all within noise, no collapse, no filler benefit.
+
+Fix: retry with backoff on 5xx/timeout (never on 4xx), bypass the system proxy (`ProxyHandler({})` — which also saved ~2.5s per request), and report `transport_err` and `parse_fail` as separate columns. **Lesson: before believing a harness's "parse failure" rate, read the error strings — infrastructure failures wear a model-behavior costume.**
+
+### Bug 5: the results file was never written (crash after the run)
+
+A companion run of the 4 additional datasets completed all 240 questions (952s) and then **crashed while saving**: `json.dump({...}, ensure_ascii=False)` was missing the file handle. The per-question raw records were lost; only the console summary survived. The fixed harness writes the file correctly, and the datasets were re-run clean (direct connection, 0 transport errors, 0 parse failures — `data/results_1792943210.json`). **Lesson: smoke-test the save path before the long run, not after.**
+
+### Bug 4: the "dose" never doubled (tokenizer ate the fillers)
+
+The same probe intended F1 = 16 dots vs F2 = 64 dots (4× dose). Qwen's BPE merges dot runs: both configurations added **exactly +2 prompt tokens** (`input_tokens` 1067 vs 1067, identical). F1 ≡ F2 by construction — the dose-response sweep never happened. The v2 probe uses `"hmm "` repetitions (≈1 token each: 8 / 64) plus a 512-dot arm and a rephrase arm, so the sweep is real. **Lesson: verify your manipulation changed the thing you think it changed — diff the token counts, don't trust the string length.**
+
 ## Method
 
 - **One model, zero fine-tuning**: Qwen3.8-27B W8A16 Marlin on 1Cat-vLLM (V100/SM70 fork), TP4 NVLink, 180W power cap, CUDA 12.8 forward-compat. The only variable is the output-constraint mechanism.
@@ -69,7 +83,7 @@ Mid-investigation we concluded "path B's json_schema doesn't lock its enum — i
 - **Path A** (this repo's home mechanism, from the [dsh-structured-output](https://github.com/dd2003-460/dsh-structured-output) plugin): Anthropic `/v1/messages` + forced tool calling (`tool_choice` pins a single function whose `input_schema` carries the dynamic enum), then the `tool_use` block is unwrapped to plain JSON.
 - **Path B**: OpenAI `/v1/chat/completions` + `response_format=json_schema` — the generic open-source route (Instructor's default, vLLM native structured outputs).
 - **Path C**: unconstrained generation + regex extraction of the answer letter (the paper's §3.6 "indirect implementation" baseline).
-- **Thinking**: off on all paths. Verified: 0/1,170 responses contained thinking artifacts; both endpoints produce no thinking block by default, and under syntax constraints reasoning is squeezed out entirely (A/B emit 7–15 tokens per response).
+- **Thinking**: off on all paths. Verified two ways: 0/1,170 responses contained thinking artifacts, and this model/fork has **no separate reasoning channel at all** — `reasoning_content` is always empty and `reasoning_tokens` is never reported, under every toggle we tried (`chat_template_kwargs.enable_thinking`, payload `thinking:{type:enabled}`, default). Unconstrained, the model writes its reasoning *inline* in `content` (312 tokens of "Step 1… Step 2…" for 17+25). Consequence for the thinking probe: a "schema + enable_thinking" config silently degenerates to the no-thinking config, because the schema squeezes the inline reasoning out (that's why C2 was *faster* than C0).
 
 ## Token economics (the practical argument for structured output)
 
@@ -140,15 +154,21 @@ Dockerfile                        # benchmark runner image (fully containerized 
 scripts/reproduce.sh              # one-command pipeline: download -> bench -> summary
 requirements.txt                  # empty: stdlib only
 harness/jev_bench_download.py     # pull 5 datasets via HF datasets-server API (no datasets lib)
-harness/jev_bench_run.py          # 3-path benchmark, temp-locked, bijective labels, case-sensitive
-harness/thinking_probe.py         # C0-C4 thinking-mode experiment (incl. prompt_logprobs "first instinct")
-harness/prefill_thinking_probe.py # F0-F3 filler-token experiment ("think during prefill")
+harness/jev_bench_download2.py    # pull 4 more datasets (hellaswag/mathqa/truthfulqa/imdb)
+harness/jev_bench_run.py          # 3-path benchmark, temp-locked, bijective labels, case-sensitive,
+                                  #   retry-on-transport-error, proxy-bypass, err/parse_fail split
+harness/thinking_probe.py         # C0-C5 thinking-mode experiment (incl. prompt_logprobs "first instinct"
+                                  #   and the JEV-paper logprob protocol via /v1/completions)
+harness/prefill_thinking_probe.py # F0-F4 filler-token experiment ("think during prefill")
 probes/ab_probe.py                # determinism probe + enum strictness controls
 probes/ab_rerun60.py              # 60-question temperature-locked re-run
-data/*.jsonl                      # evaluation sets (390 questions, frozen splits)
+data/*.jsonl                      # evaluation sets (9 datasets, 840 questions, frozen splits)
 data/results_1792928998.json      # ALL 1,170 raw records from run v1 (contains the two bugs — kept for transparency)
+data/results_1792943210.json      # clean re-run of the 4 new datasets (direct connection, 0 transport errors)
+data/prefill_probe_1792941546.json # filler probe v1 raw records (contains the 502 artifact — kept for transparency)
+data/run2_pathA.log               # first run of the 4 new datasets via proxy (summary survives, raw lost to Bug 5)
 data/full_run.log                 # run v1 console log
-reports/                          # full write-up (Chinese) + interactive per-question viewer
+reports/                          # full write-up (Chinese) + interactive per-question viewer + Path A 9-dataset table
 ```
 
 ## Thinking during prefill (filler tokens) — papers and probe
@@ -161,7 +181,19 @@ The token-economics argument above says decode tokens are the expensive currency
 | Merrill & Sabharwal 2024, *Let's Think Dot by Dot* (arXiv:2404.15758) | on synthetic tasks, filler `…` lifts a trained Llama-34M from 66% → 100%; but Claude 2 / GPT-3.5 showed **no gain** on standard QA, and exploiting fillers needs dense supervision training |
 | 2026, *Reading Between the Dots* (arXiv:2607.03502) | frontier open models (DeepSeek V3, Kimi K2) **do** compute over filler regions — attention routes the question through the filler block to the answer, and KV-cache transplants at filler positions causally swap outputs |
 
-The disagreement is about *which* models learned to use filler positions. `harness/prefill_thinking_probe.py` tests it on our stack with zero training: F0 baseline / F1 +16 dots / F2 +64 dots / F3 question-restatement, all appended to the prompt (pure **prefill** cost, zero decode tokens), structured output forced. Watch `input_tokens` vs `output_tokens` in the results — that's the whole trade in one line.
+The disagreement is about *which* models learned to use filler positions. `harness/prefill_thinking_probe.py` tests it on our stack with zero training: F0 baseline / F1 +`"hmm "`×8 / F2 +`"hmm "`×64 / F3 +512 dots (the dot-by-dot arm) / F4 question-restatement, all appended to the prompt (pure **prefill** cost, zero decode tokens), structured output forced. Watch `input_tokens` vs `output_tokens` in the results — that's the whole trade in one line. (v1 of this probe used 16 vs 64 dots — see Bug 4: BPE merged them into the same +2 tokens, so the sweep was fake.)
+
+## Thinking-mode experiment (C0–C4)
+
+`harness/thinking_probe.py`, 60 questions (banking77 30 + arc 30), temperature locked, structured output forced except where noted:
+
+| Config | Mechanism | Accuracy | Output tokens | Latency |
+|---|---|---|---|---|
+| C0 | pure structured (json_schema, single enum) | **85.0%** (51/60) | 13 | 14.8s |
+| C1 | + one-line reason (low-budget CoT) | 81.7% (49/60) | 86 (×6.6) | 17.5s |
+| C2 | schema + enable_thinking | 83.3% (50/60) | 10 | 10.8s |
+
+**Low-budget CoT loses on every axis for choice tasks**: 6.6× the tokens, 18% more latency, −3.3pp accuracy (including 2 JSON parse failures). C2 is a control that degenerated to C0 (no reasoning channel on this stack — see Method). The structured constraint already does the "thinking" for a decision task; making the model write it down costs tokens and buys nothing. C3 (two-phase: unconstrained analysis → re-prefilled digest under schema) and C4 (prompt_logprobs "first instinct", zero extra decode cost) were still running at the time of writing.
 
 ## Hardware note
 

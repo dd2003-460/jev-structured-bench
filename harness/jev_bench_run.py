@@ -58,6 +58,11 @@ BENCH_DIR = os.environ.get(
     "BENCH_DIR", os.path.normpath(os.path.join(_HERE, "..", "data", "jev-bench")))
 TEMPERATURE = 0  # benchmark 一律 greedy；两端点默认都在采样，必须显式锁 0
 
+# 绕过 Mac 系统代理（http_proxy=127.0.0.1:51647）：该代理对 tailscale 地址时通时断，
+# 失败时报 "upstream connect failed: connection timed out"（miHomo 风格 502），
+# 曾把传输错误误记成模型解析失败。直连还顺带每请求省 ~2.5s。
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 # ---------------- 冻结模板（每数据集一个，对齐论文协议） ----------------
 TASKS = {
     "mmlu":     "The following is a multiple-choice question. Answer with the letter of the correct option.",
@@ -65,8 +70,14 @@ TASKS = {
     "sst2":     "Classify the sentiment of the following text. Answer with the letter of the correct option.",
     "agnews":   "Classify the topic of the following news article. Answer with the letter of the correct option.",
     "banking77": "Classify the banking intent of the following customer message. Answer with the letter of the correct option.",
+    # 第二批 4 集（2026-10-25 新增，口吻与上面完全一致：'… Answer with the letter of the correct option.'）
+    "hellaswag": "The following is a multiple-choice common-sense question about which ending is most likely. Answer with the letter of the correct option.",
+    "mathqa":    "The following is a multiple-choice math word problem. Answer with the letter of the correct option.",
+    "truthfulqa":"The following is a multiple-choice question. Answer with the letter of the correct option.",
+    "imdb":      "Classify the sentiment of the following movie review. Answer with the letter of the correct option.",
 }
-LIMITS = {"mmlu": 150, "arc": 60, "sst2": 60, "agnews": 60, "banking77": 60}
+LIMITS = {"mmlu": 150, "arc": 60, "sst2": 60, "agnews": 60, "banking77": 60,
+          "hellaswag": 60, "mathqa": 60, "truthfulqa": 60, "imdb": 60}
 
 
 def labels_for(n: int):
@@ -90,22 +101,34 @@ def build_prompt(ds: str, item: dict) -> str:
     return f"{TASKS[ds]}\n\n{item['question']}\n\nOptions:\n{opts}\n\nAnswer with only the letter."
 
 
-def post(url: str, payload: dict, timeout: int = 90):
+def is_transport(err):
+    """传输层错误（HTTP 5xx / 超时 / 连接失败）——重试也失败的才算，不是模型解析失败。"""
+    return bool(err) and str(err).startswith("transport:")
+
+
+def post(url: str, payload: dict, timeout: int = 90, retries: int = 3):
     data = json.dumps(payload).encode()
     headers = {"content-type": "application/json"}
     if VLLM_API_KEY:
         headers["Authorization"] = "Bearer " + VLLM_API_KEY
         headers["x-api-key"] = VLLM_API_KEY  # 双头发，兼容两种鉴权风格
-    req = urllib.request.Request(url, data=data, headers=headers)
-    t0 = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            body = json.load(r)
-        return body, time.time() - t0, None
-    except urllib.error.HTTPError as e:
-        return None, time.time() - t0, f"HTTP {e.code}: {e.read()[:200]!r}"
-    except Exception as e:
-        return None, time.time() - t0, f"{type(e).__name__}: {e}"
+    last, t0 = None, time.time()
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=data, headers=headers)
+        t0 = time.time()
+        try:
+            with _NO_PROXY_OPENER.open(req, timeout=timeout) as r:
+                body = json.load(r)
+            return body, time.time() - t0, None
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code}: {e.read()[:200]!r}"
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+        # 4xx（400/404/422 等）是请求本身的问题，重试无意义；5xx/超时/连接错误才退避重试
+        if last.startswith("HTTP 4"):
+            break
+        time.sleep(2 * (attempt + 1))
+    return None, time.time() - t0, "transport: " + str(last)
 
 
 def extract_choice(raw: str, labels):
@@ -253,23 +276,27 @@ def main():
         wall = time.time() - t0
         all_results[path] = results
 
-        # 汇总
+        # 汇总（传输错误与解析失败分开报：前者是基础设施噪声，后者才是模型/机制问题）
         print(f"  --- Path {path} 汇总 (wall {wall:.0f}s) ---")
         for ds in args.datasets:
             rs = [r for r in results if r["ds"] == ds]
             if not rs:
                 continue
-            acc = sum(1 for r in rs if r["pred"] == r["gold"]) / len(rs)
-            parse_fail = sum(1 for r in rs if not r["pred"])
+            n_tr = sum(1 for r in rs if is_transport(r.get("err")))
+            ans = [r for r in rs if not is_transport(r.get("err"))]
+            n_pf = sum(1 for r in ans if not r["pred"])
+            acc_all = sum(1 for r in rs if r["pred"] == r["gold"]) / len(rs)
+            acc_ans = (sum(1 for r in ans if r["pred"] == r["gold"]) / len(ans)) if ans else 0.0
             lats = [r["lat"] for r in rs if r["lat"]]
             toks = [r["out_tok"] for r in rs if r["out_tok"]]
-            print(f"    {ds:10s} n={len(rs):3d} acc={acc*100:5.1f}% parse_fail={parse_fail:3d} "
+            print(f"    {ds:10s} n={len(rs):3d} acc={acc_all*100:5.1f}% "
+                  f"(answered {acc_ans*100:5.1f}%) transport_err={n_tr:2d} parse_fail={n_pf:2d} "
                   f"lat_avg={sum(lats)/len(lats):5.2f}s tok_avg={sum(toks)/len(toks) if toks else 0:5.1f}")
 
     out = f"{BENCH_DIR}/results_{int(time.time())}.json"
     with open(out, "w") as f:
         json.dump({"model": MODEL, "temperature": TEMPERATURE, "paths": args.paths,
-                   "datasets": args.datasets, "results": all_results}, ensure_ascii=False)
+                   "datasets": args.datasets, "results": all_results}, f, ensure_ascii=False)
     print(f"\n结果已存: {out}", flush=True)
 
 

@@ -22,8 +22,10 @@ curl -s --noproxy '*' --max-time 5 "${VLLM_BASE:-http://127.0.0.1:8000}/v1/model
   ${VLLM_API_KEY:+-H "Authorization: Bearer $VLLM_API_KEY"} >/dev/null \
   && echo "vLLM 可达: ${VLLM_BASE}" || { echo "vLLM 不可达，先起服务（docker compose up -d）"; exit 1; }
 
-echo "== 1/3 下载评测集（HF datasets-server，600 题）=================="
-python3 harness/jev_bench_download.py
+echo "== 1/3 下载评测集（HF datasets-server，5+4=9 数据集 840 题）==========="
+python3 harness/jev_bench_download.py    # 原 5 集：mmlu/arc/sst2/agnews/banking77
+python3 harness/jev_bench_download2.py   # 新 4 集：hellaswag/mathqa/truthfulqa/imdb
+                                           # （mathqa 走官方 MathQA.zip，其余走 datasets-server REST）
 
 echo "== 2/3 三路径 benchmark（A=强制工具调用 / B=json_schema / C=自由文本）=="
 # 并发默认 6；显存小或服务远（跨网 300ms+）建议降到 2-3

@@ -1,0 +1,22 @@
+题目总数: 240/路径 × 1 路径, 并发 6, temp=0
+
+===== Path A: 本地 skill 机制（structured-dispatch：Anthropic 端点+强制工具调用） =====
+  50/240  (231s)
+  100/240  (425s)
+  150/240  (612s)
+  200/240  (809s)
+  --- Path A 汇总 (wall 952s) ---
+    hellaswag  n= 60 acc= 85.0% parse_fail=  1 lat_avg=24.49s tok_avg=  7.2
+    mathqa     n= 60 acc= 48.3% parse_fail=  2 lat_avg=26.13s tok_avg= 11.1
+    truthfulqa n= 60 acc= 71.7% parse_fail=  6 lat_avg=18.75s tok_avg= 11.2
+    imdb       n= 60 acc= 78.3% parse_fail=  9 lat_avg=25.29s tok_avg= 12.0
+Traceback (most recent call last):
+  File "/Users/a1-6/WorkBuddy/2026-10-16-20-29-01/scripts/jev_bench_run.py", line 283, in <module>
+    main()
+    ~~~~^^
+  File "/Users/a1-6/WorkBuddy/2026-10-16-20-29-01/scripts/jev_bench_run.py", line 277, in main
+    json.dump({"model": MODEL, "temperature": TEMPERATURE, "paths": args.paths,
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+               "datasets": args.datasets, "results": all_results}, ensure_ascii=False)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: dump() missing 1 required positional argument: 'fp'

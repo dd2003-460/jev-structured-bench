@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Thinking-mode controlled experiment for structured decision tasks.
 
-Five configurations, same questions, same frozen template, temperature=0:
+Six configurations, same questions, same frozen template, temperature=0:
 
   C0  structured only          — response_format json_schema, choice enum, thinking off
   C1  + one-line reason        — same + {choice, confidence, reason} (low-budget CoT)
@@ -13,9 +13,21 @@ Five configurations, same questions, same frozen template, temperature=0:
                                  position ("first instinct" after reading the question).
                                  Zero extra decode cost: the prefill forward pass already
                                  computed that distribution. Tests free selective-prediction.
+  C5  paper protocol           — JEV arXiv 2609.37647 口径的本地复刻：/v1/completions
+                                 （无 chat 模板）raw prompt 正好结束在答题位，
+                                 prompt_logprobs top-20，只在选项字母 token 内重归一化取
+                                 argmax。零额外 decode 成本。
 
 Metrics per config: accuracy, wall-clock, output tokens, thinking tokens (C2/C3 phase1),
-and (C4) agreement between first-instinct argmax and the structured answer.
+and (C4/C5) agreement between first-instinct argmax and the structured answer.
+
+C4 bug found 2026-10-25（第一版 C4 输出作废，已修）：
+  1. vLLM 的 prompt_logprobs dict 的 **key 是 token ID 字符串**（"271"），不是 token 文本；
+     文本在 value 的 `decoded_token` 字段里。旧代码 best[0] 取到 "271"，永远对不上字母。
+  2. 更根本的：chat 模板让最后 prompt 位置的 top1 恒为 '\n\n'（logprob=0.0，确定性），
+     答案字母 ' A' 在 rank 4——"全局 argmax"根本不是答案。论文协议的正确做法是
+     **只在选项字母 token 集合内重归一化**再取 argmax。
+  3. top_logprobs=5 覆盖不全（ banking77 的 "BY" 等标签 token 排在很后面），改 top-20。
 """
 import json
 import re
@@ -26,14 +38,18 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import os
+import argparse
 BASE = os.environ.get("VLLM_BASE", "http://127.0.0.1:8787").rstrip("/")
 API_KEY = os.environ.get("VLLM_API_KEY", "")
 MODEL = os.environ.get("VLLM_MODEL", "qwen3.8-27b-w8a16")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.environ.get("BENCH_DIR", os.path.normpath(os.path.join(_HERE, "..", "data", "jev-bench")))
 OUT = f"{BENCH}/thinking_probe_results.json"
-N_BANK, N_ARC = 30, 30
-CONCURRENCY = 2
+# prompt_logprobs 请求在这个 KV-bound 盒子上极慢（对整个 prompt 多跑一次前向），
+# C4/C5 可用这两个环境变量缩题量（如 N_ARC=30 N_BANK=0 只跑 arc）。
+N_BANK = int(os.environ.get("N_BANK", "30"))
+N_ARC = int(os.environ.get("N_ARC", "30"))
+CONCURRENCY = int(os.environ.get("CONCURRENCY", "2"))
 
 
 def curl_post(url, payload, timeout=300):
@@ -167,19 +183,50 @@ def run_one_cfg(cfg, item):
                 "model": MODEL, "max_tokens": 64, "temperature": 0,
                 "messages": [{"role": "user", "content": prompt}],
                 "response_format": schema_choice(letters),
-                "prompt_logprobs": 5})
+                "prompt_logprobs": 20})
             j = json.loads(body)
             raw = j["choices"][0]["message"].get("content", "")
             lp = j.get("prompt_logprobs") or []
-            instinct = None
+            instinct, top1_tok = None, None
+            if lp:
+                last = lp[-1] or {}
+                # 全局 top1（记录用：预期是 '\n\n' 之类模板前缀 token，不是答案）
+                best = max(last.items(), key=lambda kv: kv[1].get("logprob", -99)
+                           if isinstance(kv[1], dict) else -99)
+                top1_tok = (best[1] or {}).get("decoded_token") if isinstance(best[1], dict) else best[0]
+                # 论文协议：只在选项字母 token 内找 argmax（key 是 token ID，文本在 decoded_token）
+                cands = [(v.get("logprob", -99), (v.get("decoded_token") or "").strip())
+                         for v in last.values()
+                         if isinstance(v, dict) and (v.get("decoded_token") or "").strip() in letters]
+                if cands:
+                    instinct = max(cands)[1]
+            rec.update(raw=raw, pred=extract_choice(raw, letters), instinct=instinct,
+                       top1_tok=repr(top1_tok),
+                       agree=(instinct is not None and instinct == extract_choice(raw, letters)),
+                       out_tok=usage_of(j)[0], think_tok=usage_of(j)[2])
+        elif cfg == "C5":
+            # JEV 论文口径本地复刻：raw completion（无 chat 模板），prompt 结束在答题位，
+            # 最后位置 top-20 logprobs，选项字母 token 内重归一化取 argmax。
+            raw_prompt = (prompt + "\n\nAnswer: ")
+            body = curl_post(f"{BASE}/v1/completions", {
+                "model": MODEL, "max_tokens": 1, "temperature": 0,
+                "prompt": raw_prompt, "prompt_logprobs": 20})
+            j = json.loads(body)
+            lp = j.get("prompt_logprobs") or []
+            instinct, covered, top1_tok = None, 0, None
             if lp:
                 last = lp[-1] or {}
                 best = max(last.items(), key=lambda kv: kv[1].get("logprob", -99)
                            if isinstance(kv[1], dict) else -99)
-                instinct = best[0].strip()
-            rec.update(raw=raw, pred=extract_choice(raw, letters), instinct=instinct,
-                       agree=(instinct is not None and instinct == rec_pred_check(raw, letters)),
-                       out_tok=usage_of(j)[0], think_tok=usage_of(j)[2])
+                top1_tok = (best[1] or {}).get("decoded_token") if isinstance(best[1], dict) else best[0]
+                cands = [(v.get("logprob", -99), (v.get("decoded_token") or "").strip())
+                         for v in last.values()
+                         if isinstance(v, dict) and (v.get("decoded_token") or "").strip() in letters]
+                covered = len(cands)
+                if cands:
+                    instinct = max(cands)[1]
+            rec.update(instinct=instinct, labels_in_top20=covered,
+                       top1_tok=repr(top1_tok), out_tok=1, think_tok=0)
         rec["lat"] = round(time.time() - t0, 2)
         rec["gold"] = letters[item["answer"]]
         rec["ok"] = (rec.get("pred") == rec["gold"])
@@ -193,13 +240,20 @@ def rec_pred_check(raw, letters):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--configs", nargs="*", default=["C0", "C1", "C2", "C3", "C4", "C5"])
+    args = ap.parse_args()
     items = []
     for ds, n in (("banking77", N_BANK), ("arc", N_ARC)):
         rows = [json.loads(l) for l in open(f"{BENCH}/{ds}.jsonl")][:n]
         for r in rows:
             r["ds"] = ds
         items += rows
-    cfgs = ["C0", "C1", "C2", "C3", "C4"]
+    cfgs = args.configs
+    # 部分配置跑时单独存文件，避免覆盖全量结果（C4 第一版有 bug，重跑不能抹掉 C0-C3）
+    global OUT
+    if sorted(cfgs) != sorted(["C0", "C1", "C2", "C3", "C4", "C5"]):
+        OUT = f"{BENCH}/thinking_probe_{'_'.join(cfgs)}.json"
     results = {}
     for cfg in cfgs:
         t0 = time.time()
@@ -217,12 +271,15 @@ def main():
               f"err={err} wall={time.time()-t0:.0f}s "
               f"avg_lat={sum(lats)/len(lats):.1f}s avg_out_tok={sum(toks)/len(toks):.0f} "
               f"avg_think_tok={sum(thk)/len(thk):.0f}", flush=True)
-        if cfg == "C4":
+        if cfg in ("C4", "C5"):
             ag = sum(1 for r in rs if r.get("agree"))
             has = sum(1 for r in rs if r.get("instinct"))
             ok_inst = sum(1 for r in rs if r.get("instinct") == r.get("gold"))
-            print(f"  C4 instinct: present {has}/{len(rs)}, agree-with-structured {ag}, "
-                  f"instinct-alone acc {ok_inst}/{len(rs)}", flush=True)
+            cov = [r.get("labels_in_top20") or 0 for r in rs]
+            print(f"  {cfg} instinct: present {has}/{len(rs)}, agree-with-structured {ag}, "
+                  f"instinct-alone acc {ok_inst}/{len(rs)} "
+                  f"({ok_inst/len(rs)*100:.1f}%), labels_in_top20 avg {sum(cov)/len(cov):.1f}",
+                  flush=True)
         if cfg == "C3":
             agree13 = sum(1 for r in rs if r.get("phase1_letter") and
                           r.get("phase1_letter") == r.get("pred"))

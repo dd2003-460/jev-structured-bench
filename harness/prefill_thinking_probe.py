@@ -13,11 +13,20 @@
     filler 区路由到答案；filler 位置的 KV-cache 移植可因果性改变输出。
     说明现代大模型"真的在用" prefill 里的 filler 位置思考。
 
-本探针在本仓库的同一模型/同一模板上零训练实测四种配置：
+本探针在本仓库的同一模型/同一模板上零训练实测五种配置（2026-10-25 第二版）：
   F0  无 filler（基线）
-  F1  + 16 个 "."           （prompt 尾部追加，纯 prefill 成本，零 decode 成本）
-  F2  + 64 个 "."
-  F3  问题复述一遍再答        （同 dot-by-dot 论文的 rephrase 技巧）
+  F1  + "hmm" × 8        （约 8 个 filler token）
+  F2  + "hmm" × 64       （约 64 token，剂量 ×8）
+  F3  + "." × 512        （忠实复刻 dot-by-dot 论文的点串 filler）
+  F4  问题复述一遍再答     （同论文的 rephrase 技巧）
+
+第一版作废的两个教训（已写进报告 §0 勘误）：
+  1. F1/F2 原用 "."*16 / "."*64 —— Qwen BPE 把点串合并，两者都只 +2 token
+     （in_tok 1067 vs 1067 完全相同），"剂量翻 4 倍"从未发生，F1=F2 是必然结果。
+     改用量词化 1:1 的 "hmm" 重复，才有真实剂量扫描。
+  2. 原版把 HTTP 502（代理超时）记成 parse_fail —— 两个 benchmark 并发打服务器时
+     8787 狂返 502，准确率出现"75%→57.5% 崩盘"假象。实为传输错误，与模型无关。
+     现在 post() 带退避重试，汇总把 transport_err 与 parse_fail 分开报。
 
 关键度量：input_tokens（prefill 成本）vs output_tokens（decode 成本）分开看——
 filler token 全进 input，不产生任何 output，这就是"免费思考"的账面。
@@ -36,6 +45,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH_DIR = os.environ.get(
     "BENCH_DIR", os.path.normpath(os.path.join(_HERE, "..", "data", "jev-bench")))
 TEMPERATURE = 0
+
+# 绕过 Mac 系统代理（http_proxy=127.0.0.1:51647）：该代理对 tailscale 地址时通时断，
+# 失败时报 "upstream connect failed: connection timed out"，曾把传输错误误记成
+# 模型解析失败（2026-10-25 第一版作废的直接原因）。直连还每请求省 ~2.5s。
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 TASKS = {
     "banking77": "Classify the banking intent of the following customer message. Answer with the letter of the correct option.",
@@ -56,21 +70,34 @@ def labels_for(n: int):
     return out
 
 
-def post(url: str, payload: dict, timeout: int = 180):
+def post(url: str, payload: dict, timeout: int = 180, retries: int = 3):
     data = json.dumps(payload).encode()
     headers = {"content-type": "application/json"}
     if VLLM_API_KEY:
         headers["Authorization"] = "Bearer " + VLLM_API_KEY
         headers["x-api-key"] = VLLM_API_KEY
-    req = urllib.request.Request(url, data=data, headers=headers)
-    t0 = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.load(r), time.time() - t0, None
-    except urllib.error.HTTPError as e:
-        return None, time.time() - t0, f"HTTP {e.code}: {e.read()[:200]!r}"
-    except Exception as e:
-        return None, time.time() - t0, f"{type(e).__name__}: {e}"
+    last, t0 = None, time.time()
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=data, headers=headers)
+        t0 = time.time()
+        try:
+            with _NO_PROXY_OPENER.open(req, timeout=timeout) as r:
+                return json.load(r), time.time() - t0, None
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code}: {e.read()[:200]!r}"
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+        # 4xx 是请求问题重试无意义；5xx/超时/连接失败退避重试
+        # （2026-10-25 教训：两个 benchmark 并发打服务器时 8787 代理狂返 502，
+        #  不重试就会把"传输错误"误记成"模型解析失败"，准确率全是假崩）
+        if last.startswith("HTTP 4"):
+            break
+        time.sleep(2 * (attempt + 1))
+    return None, time.time() - t0, "transport: " + str(last)
+
+
+def is_transport(err):
+    return bool(err) and str(err).startswith("transport:")
 
 
 def build_prompt(ds: str, item: dict, filler: str = "") -> str:
@@ -85,13 +112,19 @@ def build_prompt(ds: str, item: dict, filler: str = "") -> str:
 
 def run_config(name: str, ds: str, item: dict, letters):
     opts_prompt = build_prompt(ds, item)
+    # 剂量扫描（2026-10-25 第一版作废重跑）：
+    # 第一版 F1/F2 用 "."*16 / "."*64，Qwen BPE 把点串合并成 ~2 token，
+    # 两个配置 in_tok 完全相同（1067 vs 1067）→ "剂量翻 4 倍"根本没发生，F1=F2 是必然。
+    # 这一版用 "hmm " 重复（每词约 1 token）做真实线性剂量：8 / 64 / 512 token。
     if name == "F0":
         prompt = opts_prompt
     elif name == "F1":
-        prompt = opts_prompt + "\n\n" + "." * 16
+        prompt = opts_prompt + "\n\n" + "hmm " * 8
     elif name == "F2":
-        prompt = opts_prompt + "\n\n" + "." * 64
+        prompt = opts_prompt + "\n\n" + "hmm " * 64
     elif name == "F3":
+        prompt = opts_prompt + "\n\n" + "." * 512      # 忠实复刻 dot-by-dot 论文的 filler
+    elif name == "F4":
         prompt = opts_prompt + f"\n\nRestate the question briefly, then answer.\nQuestion restated: {item['question']}"
     else:
         raise ValueError(name)
@@ -122,7 +155,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=30)
     ap.add_argument("--concurrency", type=int, default=2)
-    ap.add_argument("--configs", nargs="*", default=["F0", "F1", "F2", "F3"])
+    ap.add_argument("--configs", nargs="*", default=["F0", "F1", "F2", "F3", "F4"])
     args = ap.parse_args()
 
     items = {}
@@ -149,14 +182,19 @@ def main():
         with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
             rs = list(ex.map(work, qlist))
         results[cfg] = rs
-        ok = sum(1 for r in rs if r["pred"] == r["gold"])
-        pf = sum(1 for r in rs if not r["pred"])
+        n_tr = sum(1 for r in rs if is_transport(r.get("err")))
+        ans = [r for r in rs if not is_transport(r.get("err"))]
+        ok_all = sum(1 for r in rs if r["pred"] == r["gold"])
+        ok_ans = sum(1 for r in ans if r["pred"] == r["gold"])
+        pf = sum(1 for r in ans if not r["pred"])
         lats = [r["lat"] for r in rs if r["lat"]]
         it_ = [r["in_tok"] for r in rs if r["in_tok"]]
         ot_ = [r["out_tok"] for r in rs if r["out_tok"]]
-        print(f"[{cfg}] acc={ok/len(rs)*100:.1f}% ({ok}/{len(rs)}) parse_fail={pf} "
+        print(f"[{cfg}] acc={ok_all/len(rs)*100:.1f}% ({ok_all}/{len(rs)}) "
+              f"answered_acc={ok_ans/len(ans)*100:.1f}% ({ok_ans}/{len(ans)}) "
+              f"transport_err={n_tr} parse_fail={pf} "
               f"wall_avg={sum(lats)/len(lats):.2f}s in_tok={sum(it_)/len(it_):.0f} "
-              f"out_tok={sum(ot_)/len(ot_):.1f}")
+              f"out_tok={sum(ot_)/len(ot_):.1f}", flush=True)
 
     out = os.path.join(BENCH_DIR, f"prefill_probe_{int(time.time())}.json")
     with open(out, "w") as f:
