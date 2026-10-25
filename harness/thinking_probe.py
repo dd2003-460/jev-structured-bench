@@ -145,7 +145,7 @@ def run_one_cfg(cfg, item):
                 "model": MODEL, "max_tokens": 64, "temperature": 0,
                 "messages": [{"role": "user", "content": prompt}],
                 "response_format": schema_choice(letters)})
-            j = json.loads(body)
+            j = body
             raw = j["choices"][0]["message"].get("content", "")
             rec.update(raw=raw, pred=extract_choice(raw, letters),
                        out_tok=usage_of(j)[0], think_tok=usage_of(j)[2])
@@ -154,7 +154,7 @@ def run_one_cfg(cfg, item):
                 "model": MODEL, "max_tokens": 256, "temperature": 0,
                 "messages": [{"role": "user", "content": prompt}],
                 "response_format": schema_choice_reason(letters)})
-            j = json.loads(body)
+            j = body
             raw = j["choices"][0]["message"].get("content", "")
             rec.update(raw=raw, pred=extract_choice(raw, letters),
                        out_tok=usage_of(j)[0], think_tok=usage_of(j)[2])
@@ -165,7 +165,7 @@ def run_one_cfg(cfg, item):
                 "messages": [{"role": "user", "content": prompt}],
                 "response_format": schema_choice(letters),
                 "chat_template_kwargs": {"enable_thinking": True}})
-            j = json.loads(body)
+            j = body
             msg = j["choices"][0]["message"]
             raw = msg.get("content", "")
             rec.update(raw=raw[:600], think_raw=str(msg.get("reasoning_content") or "")[:600],
@@ -179,7 +179,7 @@ def run_one_cfg(cfg, item):
             b1 = curl_post(f"{BASE}/v1/chat/completions", {
                 "model": MODEL, "max_tokens": 1536, "temperature": 0,
                 "messages": [{"role": "user", "content": p1}]}, timeout=400)
-            j1 = json.loads(b1)
+            j1 = b1
             t1 = j1["choices"][0]["message"].get("content", "")
             m = re.search(r"LETTER:\s*([A-Za-z]{1,3})", t1)
             letter1 = m.group(1) if m else None
@@ -190,7 +190,7 @@ def run_one_cfg(cfg, item):
                 "model": MODEL, "max_tokens": 64, "temperature": 0,
                 "messages": [{"role": "user", "content": p2}],
                 "response_format": schema_choice(letters)})
-            j2 = json.loads(b2)
+            j2 = b2
             raw = j2["choices"][0]["message"].get("content", "")
             rec.update(raw=raw, think_raw=t1[:600], phase1_letter=letter1,
                        pred=extract_choice(raw, letters),
@@ -202,7 +202,7 @@ def run_one_cfg(cfg, item):
                 "messages": [{"role": "user", "content": prompt}],
                 "response_format": schema_choice(letters),
                 "prompt_logprobs": 20})
-            j = json.loads(body)
+            j = body
             raw = j["choices"][0]["message"].get("content", "")
             lp = j.get("prompt_logprobs") or []
             instinct, top1_tok = None, None
@@ -263,6 +263,9 @@ def main():
         for r in rs:
             r["ds"] = next(it["ds"] for it in items if it["id"] == r["id"])
         results[cfg] = rs
+        # 先存盘再汇总：汇总代码崩过两次（json.dump 漏句柄 / 除零），
+        # "跑完 45 分钟才在报告阶段崩、数据全丢"是本仓库 Bug 5 的教训。
+        json.dump(results, open(OUT, "w"), ensure_ascii=False)
         ok = sum(1 for r in rs if r.get("ok"))
         lats = [r["lat"] for r in rs]
         toks = [r.get("out_tok") or 0 for r in rs]
@@ -280,9 +283,10 @@ def main():
             ok_inst = sum(1 for r in rs
                           if r.get("instinct") is not None and r.get("instinct") == r.get("gold"))
             n_ans = sum(1 for r in rs if not r.get("error"))
+            pct = f"{ok_inst/has*100:.1f}% of present" if has else "n/a（无一题拿到 logprobs）"
             print(f"  C4 instinct: present {has}/{len(rs)} (answered {n_ans}), "
-                  f"agree-with-structured {ag}, instinct-alone acc {ok_inst}/{has} "
-                  f"({ok_inst/has*100:.1f}% of present)", flush=True)
+                  f"agree-with-structured {ag}, instinct-alone acc {ok_inst}/{has} ({pct})",
+                  flush=True)
         if cfg == "C3":
             agree13 = sum(1 for r in rs if r.get("phase1_letter") and
                           r.get("phase1_letter") == r.get("pred"))

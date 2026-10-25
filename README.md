@@ -34,7 +34,7 @@ This repo asks a practical engineering question: *if you can't call Jev's API, h
 
 **Conclusion: structured output costs ~3pp accuracy vs free text, and the two structured mechanisms are statistically indistinguishable (±1σ) once temperature is locked. The initially observed 23.4pp Banking77 gap was a methodology artifact.**
 
-## Erratum — five bugs found after the first runs
+## Erratum — six bugs found after the first runs
 
 This is the part worth reading if you build eval harnesses.
 
@@ -71,6 +71,10 @@ Fix: retry with backoff on 5xx/timeout (never on 4xx), bypass the system proxy (
 ### Bug 5: the results file was never written (crash after the run)
 
 A companion run of the 4 additional datasets completed all 240 questions (952s) and then **crashed while saving**: `json.dump({...}, ensure_ascii=False)` was missing the file handle. The per-question raw records were lost; only the console summary survived. The fixed harness writes the file correctly, and the datasets were re-run clean (direct connection, 0 transport errors, 0 parse failures — `data/results_1792943210.json`). **Lesson: smoke-test the save path before the long run, not after.**
+
+### Bug 6: a refactor silently broke every request (60/60 "model errors" that were ours)
+
+While adding retry logic to the thinking probe's `curl_post`, the helper's return type changed from *raw response string* to *parsed dict* — but the six call sites still did `json.loads(body)` on it. Every request "failed" with `TypeError: the JSON object must be str, bytes or bytearray, not dict` and was dutifully recorded as a model error: **acc 0/60, err 60** after a 45-minute run. The summary then crashed on a `ZeroDivisionError` (0 present instincts), losing the results file — again. Fixes: call sites use the dict directly; the summary guards division by zero; **results are now saved before the summary is printed** (the Bug 5 lesson, applied). **Lesson: when a run reports 100% failure, suspect the harness first — and make the save path crash-proof, because reporting code fails too.**
 
 ### Bug 4: the "dose" never doubled (tokenizer ate the fillers)
 
@@ -183,6 +187,8 @@ The token-economics argument above says decode tokens are the expensive currency
 
 The disagreement is about *which* models learned to use filler positions. `harness/prefill_thinking_probe.py` tests it on our stack with zero training: F0 baseline / F1 +`"hmm "`×8 / F2 +`"hmm "`×64 / F3 +512 dots (the dot-by-dot arm) / F4 question-restatement, all appended to the prompt (pure **prefill** cost, zero decode tokens), structured output forced. Watch `input_tokens` vs `output_tokens` in the results — that's the whole trade in one line. (v1 of this probe used 16 vs 64 dots — see Bug 4: BPE merged them into the same +2 tokens, so the sweep was fake.)
 
+**The C4 result predicts the outcome**: the label-restricted argmax of the prefill distribution already agrees with the final answer 30/30 (see Thinking-mode experiment). The model decides *while reading the question* — so anything appended after the question cannot change the decision, and filler tokens have nothing to compute with. Filler "thinking" needs a model that was *trained* to use pause positions (Goyal et al.); ours wasn't.
+
 ## Thinking-mode experiment (C0–C4)
 
 `harness/thinking_probe.py`, 60 questions (banking77 30 + arc 30), temperature locked, structured output forced except where noted:
@@ -192,8 +198,12 @@ The disagreement is about *which* models learned to use filler positions. `harne
 | C0 | pure structured (json_schema, single enum) | **85.0%** (51/60) | 13 | 14.8s |
 | C1 | + one-line reason (low-budget CoT) | 81.7% (49/60) | 86 (×6.6) | 17.5s |
 | C2 | schema + enable_thinking | 83.3% (50/60) | 10 | 10.8s |
+| C3 | two-phase (unconstrained analysis → digest under schema) | 73.3% (44/60) | 315 (×24) | 60.4s |
+| C4 | C0 + prompt_logprobs "first instinct" (fixed version, arc 30) | 96.7% (29/30) | 13 | 14.8s |
 
-**Low-budget CoT loses on every axis for choice tasks**: 6.6× the tokens, 18% more latency, −3.3pp accuracy (including 2 JSON parse failures). C2 is a control that degenerated to C0 (no reasoning channel on this stack — see Method). The structured constraint already does the "thinking" for a decision task; making the model write it down costs tokens and buys nothing. C3 (two-phase: unconstrained analysis → re-prefilled digest under schema) and C4 (prompt_logprobs "first instinct", zero extra decode cost) were still running at the time of writing.
+**Low-budget CoT loses on every axis for choice tasks**: 6.6× the tokens, 18% more latency, −3.3pp accuracy (including 2 JSON parse failures). Full two-phase thinking is worse still: −11.7pp vs C0 at 24× the tokens. C2 is a control that degenerated to C0 (no reasoning channel on this stack — see Method). The structured constraint already does the "thinking" for a decision task; making the model write it down costs tokens and buys nothing.
+
+**The C4 finding is the deepest one**: the label-restricted argmax of the *prefill* distribution (free — the forward pass already computed it) agrees with the structured answer **30/30** on arc and scores identically (96.7%). *The model decides while reading the question; the constrained decode just voices the decision.* Consequences: (1) filler-token "thinking during prefill" cannot help on this stack, because the decision is already made by the time any appended filler is read; (2) `prompt_logprobs` gives you a **free calibrated-ish confidence signal** for selective prediction — abstain or escalate when the option distribution is flat or disagrees with the generated answer; (3) the JEV paper's log-likelihood protocol reproduces at parity with the generation protocol on this model — Jev's edge over Qwen is calibration and knowledge depth, not "choosing better".
 
 ## Hardware note
 
