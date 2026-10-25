@@ -118,6 +118,15 @@ python3 harness/thinking_probe.py        # C0 pure / C1 +reason / C2 full thinki
 python3 harness/prefill_thinking_probe.py  # filler-token "thinking during prefill" (F0-F3)
 ```
 
+**Fully containerized** (no host python needed):
+
+```bash
+docker compose up -d                          # vLLM server
+docker build -t jev-bench .                   # benchmark runner image
+docker run --rm --env-file .env jev-bench     # full run
+docker run --rm --env-file .env jev-bench --limit 30   # smoke test
+```
+
 Environment variables (all optional, sane defaults): `VLLM_BASE` (default `http://127.0.0.1:8787`), `VLLM_API_KEY`, `VLLM_MODEL`, `BENCH_DIR`, `CONCURRENCY`.
 
 **Honest scope note**: the *numbers* in this repo were produced on 4×V100 + the 1Cat-vLLM fork + Qwen3.8-27B W8A16 — a setup you may not have. What reproduces anywhere is the **methodology** (three constraint mechanisms, frozen templates, locked temperature, bijective labels, case-sensitive scoring) and the **bug findings** (any harness that forgets `temperature` or coerces label case will manufacture gaps that aren't there). Swap in any instruct model via `.env` to re-run the comparison on your own hardware.
@@ -126,6 +135,7 @@ Environment variables (all optional, sane defaults): `VLLM_BASE` (default `http:
 
 ```
 docker-compose.yml                # one-command vLLM server (standard image, any GPU)
+Dockerfile                        # benchmark runner image (fully containerized path)
 .env.example                      # copy to .env; MODEL / VLLM_BASE / VLLM_API_KEY
 scripts/reproduce.sh              # one-command pipeline: download -> bench -> summary
 requirements.txt                  # empty: stdlib only
