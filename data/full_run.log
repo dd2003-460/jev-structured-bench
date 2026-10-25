@@ -1,0 +1,48 @@
+题目总数: 390/路径 × 3 路径, 并发 6
+
+===== Path A: 本地 skill 机制（structured-dispatch：Anthropic 端点+强制工具调用） =====
+  50/390  (153s)
+  100/390  (303s)
+  150/390  (457s)
+  200/390  (487s)
+  250/390  (529s)
+  300/390  (555s)
+  350/390  (588s)
+  --- Path A 汇总 (wall 615s) ---
+    mmlu       n=150 acc= 68.7% parse_fail=  2 lat_avg=17.15s tok_avg=  9.8
+    arc        n= 60 acc= 95.0% parse_fail=  0 lat_avg= 6.23s tok_avg= 11.2
+    sst2       n= 60 acc= 98.3% parse_fail=  0 lat_avg= 4.72s tok_avg= 11.2
+    agnews     n= 60 acc= 78.3% parse_fail=  0 lat_avg= 3.57s tok_avg= 11.6
+    banking77  n= 60 acc= 76.7% parse_fail=  0 lat_avg= 3.96s tok_avg=  7.1
+
+===== Path B: 公开同类机制（Instructor/vLLM：response_format json_schema） =====
+  50/390  (24s)
+  100/390  (46s)
+  150/390  (66s)
+  200/390  (89s)
+  250/390  (108s)
+  300/390  (129s)
+  350/390  (156s)
+  --- Path B 汇总 (wall 177s) ---
+    mmlu       n=150 acc= 68.0% parse_fail=  0 lat_avg= 2.58s tok_avg= 12.2
+    arc        n= 60 acc= 91.7% parse_fail=  0 lat_avg= 2.73s tok_avg= 12.1
+    sst2       n= 60 acc= 98.3% parse_fail=  0 lat_avg= 2.47s tok_avg= 12.2
+    agnews     n= 60 acc= 73.3% parse_fail=  0 lat_avg= 2.82s tok_avg= 13.1
+    banking77  n= 60 acc= 53.3% parse_fail=  0 lat_avg= 3.22s tok_avg= 11.8
+
+===== Path C: 自由文本基线（无约束+正则解析） =====
+  50/390  (16s)
+  100/390  (31s)
+  150/390  (47s)
+  200/390  (63s)
+  250/390  (82s)
+  300/390  (99s)
+  350/390  (116s)
+  --- Path C 汇总 (wall 131s) ---
+    mmlu       n=150 acc= 74.7% parse_fail=  0 lat_avg= 1.84s tok_avg=  2.0
+    arc        n= 60 acc= 96.7% parse_fail=  0 lat_avg= 2.08s tok_avg=  2.0
+    sst2       n= 60 acc= 98.3% parse_fail=  0 lat_avg= 2.02s tok_avg=  2.0
+    agnews     n= 60 acc= 78.3% parse_fail=  0 lat_avg= 1.95s tok_avg=  2.0
+    banking77  n= 60 acc= 80.0% parse_fail=  1 lat_avg= 2.31s tok_avg=  2.0
+
+结果已存: /tmp/jev_bench/results_1792928998.json
