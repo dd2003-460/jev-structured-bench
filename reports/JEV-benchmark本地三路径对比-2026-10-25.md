@@ -167,7 +167,19 @@ python3 scripts/jev_bench_run.py --concurrency 6
 
 ### 9.3 预填充 filler 实验（回答"有什么办法利用 prefill 过程思考"）
 
-论文线：Goyal 2023 pause tokens（要训练）/ Merrill&Sabharwal 2024 dot-by-dot（Llama-34M 合成任务 66%→100%，常规 QA 无益）/ 2026 Reading Between the Dots（DeepSeek V3/Kimi K2 确实在 filler 区做隐藏计算）。v1 结果因传输错误作废（见 §0 勘误 3/4），v2 重跑中（F0 基线 / F1 "hmm"×8 / F2 "hmm"×64 / F3 点串×512 / F4 问题复述）。v1 清洗后（只看拿到答案的题）无任何 filler 有效证据（83.3/81.3/81.3/79.3），且这些模型没有经过 pause-token 训练——**"免费思考"在本任务上不成立的预期先例充分**。
+论文线：Goyal 2023 pause tokens（要训练）/ Merrill&Sabharwal 2024 dot-by-dot（Llama-34M 合成任务 66%→100%，常规 QA 无益）/ 2026 Reading Between the Dots（DeepSeek V3/Kimi K2 确实在 filler 区做隐藏计算）。
+
+v2 干净重跑（40 题 = arc 20 + banking77 20，直连+重试，**零传输错误零解析失败**；in_tok 证明剂量是真的：F1 +10、F2 +66、F3 +9、F4 +40 token）：
+
+| 配置 | 追加内容 | 准确率 | in_tok | out_tok |
+|---|---|---|---|---|
+| F0 | 无（基线） | 85.0%（34/40） | 726 | 11.7 |
+| F1 | "hmm"×8 | 82.5%（33/40） | 736 | 8.4 |
+| F2 | "hmm"×64 | 85.0%（34/40） | 792 | 9.1 |
+| F3 | 点串×512 | 85.0%（34/40） | 735 | 9.5 |
+| F4 | 问题复述 | 82.5%（33/40） | 766 | 8.5 |
+
+**结论：filler token 对准确率零影响**（五配置全在 ±1 题 = ±2.5pp 噪声带内，无剂量趋势）。v1 的"崩盘"是传输错误假象（见 §0 勘误 3），v1 的"剂量翻 4 倍"是 tokenizer 合并假象（勘误 4）。**机制解释见 §9.4：模型读题即决断，filler 没有可计算的东西；且本模型未经 pause-token 训练，不会利用 filler 位置。**
 
 ### 9.4 第一念实验 C4（修复版，arc 30 题直连）：prefill 已经决定了答案
 

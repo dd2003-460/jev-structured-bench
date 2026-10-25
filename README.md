@@ -189,6 +189,8 @@ The disagreement is about *which* models learned to use filler positions. `harne
 
 **The C4 result predicts the outcome**: the label-restricted argmax of the prefill distribution already agrees with the final answer 30/30 (see Thinking-mode experiment). The model decides *while reading the question* — so anything appended after the question cannot change the decision, and filler tokens have nothing to compute with. Filler "thinking" needs a model that was *trained* to use pause positions (Goyal et al.); ours wasn't.
 
+The v2 probe (40 questions, direct connection, retry — **0 transport errors, 0 parse failures**; token counts confirm the dose is real: +10 / +66 / +9 / +40 input tokens) finds exactly that: F0 85.0% / F1 82.5% / F2 85.0% / F3 85.0% / F4 82.5% — all within ±1 question of baseline, no dose trend. **Free, and worthless — on this model, for this task class.**
+
 ## Thinking-mode experiment (C0–C4)
 
 `harness/thinking_probe.py`, 60 questions (banking77 30 + arc 30), temperature locked, structured output forced except where noted:
