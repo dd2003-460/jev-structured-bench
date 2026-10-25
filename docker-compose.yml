@@ -1,0 +1,46 @@
+# JEV-style structured-output benchmark — one-command vLLM server
+#
+# 用法：
+#   cp .env.example .env   # 按你的卡改 MODEL / HF 模型路径
+#   docker compose up -d
+#   curl http://127.0.0.1:8000/v1/models   # 等模型加载完（大模型几分钟）
+#
+# 说明：原始实验在 4×V100 + 1Cat-vLLM fork 上完成（见 README"硬件与口径"），
+# 任何支持 OpenAI API + 结构化输出（response_format json_schema）+ 工具调用的
+# vLLM 部署都能复现本仓库的方法论对比。改 .env 里的 MODEL 即可换成你手里的模型。
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: jev-bench-vllm
+    ipc: host
+    ports:
+      - "8000:8000"
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
+    command:
+      - --model
+      - ${MODEL:-Qwen/Qwen3-8B}
+      - --served-model-name
+      - ${SERVED_NAME:-qwen3.8-27b-w8a16}
+      - --max-model-len
+      - "${MAX_MODEL_LEN:-8192}"
+      - --gpu-memory-utilization
+      - "0.90"
+      # 不开 api-key 时把下一行删掉；VLLM_API_KEY 与 .env 保持一致
+      - --api-key
+      - ${VLLM_API_KEY:-sk-local-test}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 300s

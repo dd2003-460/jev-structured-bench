@@ -79,7 +79,7 @@ Mid-investigation we concluded "path B's json_schema doesn't lock its enum — i
 | A forced tool call | ~7–13 | 4.7–17.2s |
 | B json_schema | ~7–13 | ~1.5–4s |
 
-On this KV-bandwidth-bound 4×V100 box, decode step cost dominates; A's 3–7× latency penalty comes from the Anthropic-endpoint forwarding chain (SSE assembly in the local proxy), not from the constraint itself.
+On this KV-bandwidth-bound 4×V100 box, decode step cost dominates; A's 3–7× latency penalty in run v1 came from the Anthropic-endpoint forwarding chain (SSE assembly in the local proxy) — **not** from the constraint. Hitting vLLM's `/v1/messages` directly (verified while building this repo's reproduce path) removes most of that gap.
 
 ## Public scores for context (mind the caliber!)
 
@@ -95,34 +95,63 @@ Jev itself (log-likelihood caliber): **95–99%** on IMDB/SST-2/HellaSwag/ARC, 8
 
 **The honest gap statement**: on generation-caliber ARC we reach 95.0–96.7% vs Jev's ~97.6%; on knowledge-heavy MMLU we're at ~69% vs Jev's 91% — but that MMLU comparison crosses calibers (generation vs log-likelihood) and is **not** apples-to-apples. The one real, structural deficit: our `confidence` values are self-reported, not calibrated — Jev's are calibrated and support selective prediction.
 
+## Reproduce (10 minutes on any GPU)
+
+The benchmark needs **only a vLLM server** — no proxy, no plugin, no special fork. We verified Path A (forced tool calling) works by hitting vLLM's Anthropic-compatible `/v1/messages` **directly**: HTTP 200, clean `tool_use` block, correct answer. The original runs went through a local proxy (`:8787`); the proxy added the 3–7× latency, not the constraint.
+
+```bash
+# 0. prerequisites: docker + an NVIDIA GPU + python3 (>=3.9, stdlib only)
+
+# 1. configure and start vLLM (any tool-calling instruct model works)
+cp .env.example .env && $EDITOR .env     # set MODEL / VLLM_API_KEY
+docker compose up -d                     # waits for /health (big models take minutes)
+
+# 2. export the same env for the harness
+set -a && . ./.env && set +a
+
+# 3. one command: download datasets -> run 3 paths -> print summary
+./scripts/reproduce.sh                   # full run: 390 questions x 3 paths
+./scripts/reproduce.sh --limit 30        # 5-minute smoke test
+
+# 4. (optional) thinking/prefill experiments
+python3 harness/thinking_probe.py        # C0 pure / C1 +reason / C2 full thinking / C3 two-phase / C4 logprobs
+python3 harness/prefill_thinking_probe.py  # filler-token "thinking during prefill" (F0-F3)
+```
+
+Environment variables (all optional, sane defaults): `VLLM_BASE` (default `http://127.0.0.1:8787`), `VLLM_API_KEY`, `VLLM_MODEL`, `BENCH_DIR`, `CONCURRENCY`.
+
+**Honest scope note**: the *numbers* in this repo were produced on 4×V100 + the 1Cat-vLLM fork + Qwen3.8-27B W8A16 — a setup you may not have. What reproduces anywhere is the **methodology** (three constraint mechanisms, frozen templates, locked temperature, bijective labels, case-sensitive scoring) and the **bug findings** (any harness that forgets `temperature` or coerces label case will manufacture gaps that aren't there). Swap in any instruct model via `.env` to re-run the comparison on your own hardware.
+
 ## Files
 
 ```
-harness/jev_bench_download.py   # pull 5 datasets via HF datasets-server API (no datasets lib)
-harness/jev_bench_run.py        # 3-path benchmark, temp-locked, bijective labels, case-sensitive
-probes/ab_probe.py              # determinism probe + enum strictness controls
-probes/ab_rerun60.py            # 60-question temperature-locked re-run
-data/*.jsonl                    # evaluation sets (390 questions, frozen splits)
-data/results_1792928998.json    # ALL 1,170 raw records from run v1 (contains the two bugs — kept for transparency)
-data/full_run.log               # run v1 console log
-reports/                        # full write-up (Chinese) + interactive per-question viewer
+docker-compose.yml                # one-command vLLM server (standard image, any GPU)
+.env.example                      # copy to .env; MODEL / VLLM_BASE / VLLM_API_KEY
+scripts/reproduce.sh              # one-command pipeline: download -> bench -> summary
+requirements.txt                  # empty: stdlib only
+harness/jev_bench_download.py     # pull 5 datasets via HF datasets-server API (no datasets lib)
+harness/jev_bench_run.py          # 3-path benchmark, temp-locked, bijective labels, case-sensitive
+harness/thinking_probe.py         # C0-C4 thinking-mode experiment (incl. prompt_logprobs "first instinct")
+harness/prefill_thinking_probe.py # F0-F3 filler-token experiment ("think during prefill")
+probes/ab_probe.py                # determinism probe + enum strictness controls
+probes/ab_rerun60.py              # 60-question temperature-locked re-run
+data/*.jsonl                      # evaluation sets (390 questions, frozen splits)
+data/results_1792928998.json      # ALL 1,170 raw records from run v1 (contains the two bugs — kept for transparency)
+data/full_run.log                 # run v1 console log
+reports/                          # full write-up (Chinese) + interactive per-question viewer
 ```
 
-## Reproduce
+## Thinking during prefill (filler tokens) — papers and probe
 
-```bash
-# 1. datasets (600 questions across 5 sets; HF datasets-server REST, no deps)
-python3 harness/jev_bench_download.py
+The token-economics argument above says decode tokens are the expensive currency. Can a model "think" without spending them? A 2024–2026 line of work says yes:
 
-# 2. benchmark against a local vLLM (OpenAI + Anthropic-compatible endpoints)
-python3 harness/jev_bench_run.py --concurrency 6
+| Paper | Finding |
+|---|---|
+| Goyal et al. 2023, *Think before you speak* (pause tokens) | models **trained** with pause tokens use those positions for extra internal computation |
+| Merrill & Sabharwal 2024, *Let's Think Dot by Dot* (arXiv:2404.15758) | on synthetic tasks, filler `…` lifts a trained Llama-34M from 66% → 100%; but Claude 2 / GPT-3.5 showed **no gain** on standard QA, and exploiting fillers needs dense supervision training |
+| 2026, *Reading Between the Dots* (arXiv:2607.03502) | frontier open models (DeepSeek V3, Kimi K2) **do** compute over filler regions — attention routes the question through the filler block to the answer, and KV-cache transplants at filler positions causally swap outputs |
 
-# 3. methodology probes (determinism, enum strictness, temp-locked re-run)
-python3 probes/ab_probe.py probe
-python3 probes/ab_rerun60.py
-```
-
-Endpoints default to `http://127.0.0.1:8787` (a local Anthropic/OpenAI proxy in front of vLLM). Point `BASE_PROXY` / upstream at your own server.
+The disagreement is about *which* models learned to use filler positions. `harness/prefill_thinking_probe.py` tests it on our stack with zero training: F0 baseline / F1 +16 dots / F2 +64 dots / F3 question-restatement, all appended to the prompt (pure **prefill** cost, zero decode tokens), structured output forced. Watch `input_tokens` vs `output_tokens` in the results — that's the whole trade in one line.
 
 ## Hardware note
 

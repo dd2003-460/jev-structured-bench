@@ -34,14 +34,28 @@ jev_bench_run.py — JEV 风格 benchmark：本地 skill 机制 vs 公开同类�
   python3 jev_bench_run.py --limit 60 --concurrency 6          # 跑全部三条路径
   python3 jev_bench_run.py --paths A B --limit 30              # 只跑指定路径
   python3 jev_bench_run.py --paths A --datasets mmlu sst2      # 只跑指定数据集
+
+环境变量（复现时按部署改这三个就够）：
+  VLLM_BASE     vLLM 服务基址，默认 http://127.0.0.1:8787
+                （实测可直连服务器 http://100.112.53.47:8000，无需任何代理）
+  VLLM_API_KEY 服务器开 --api-key 时必填（Authorization Bearer + x-api-key 双头发）
+  VLLM_MODEL   模型名，默认 qwen3.8-27b-w8a16（换成你自己的部署模型即可）
+  BENCH_DIR    评测集目录，默认脚本同级 ../data/jev-bench/
 """
 from __future__ import annotations
-import argparse, json, re, sys, time, urllib.request, urllib.error
+import argparse, json, os, re, sys, time, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
-BASE_PROXY = "http://127.0.0.1:8787"
-MODEL = "qwen3.8-27b-w8a16"
-BENCH_DIR = "/Users/a1-6/WorkBuddy/2026-10-16-20-29-01/data/jev-bench"
+# ---- 环境变量配置（复现友好：一条 vLLM 基址即可，无需任何代理）----
+# 实测：1Cat-vLLM fork 的 /v1/messages 原生支持 tools + tool_choice 强制工具调用，
+# Path A 直连服务器即可跑通（HTTP 200, tool_use 干净返回），不需要 8787 代理。
+# 标准 vLLM（含 Anthropic API 支持的版本）同样适用。
+VLLM_BASE = os.environ.get("VLLM_BASE", "http://127.0.0.1:8787").rstrip("/")
+VLLM_API_KEY = os.environ.get("VLLM_API_KEY", "")  # 服务器开 --api-key 时必填
+MODEL = os.environ.get("VLLM_MODEL", "qwen3.8-27b-w8a16")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+BENCH_DIR = os.environ.get(
+    "BENCH_DIR", os.path.normpath(os.path.join(_HERE, "..", "data", "jev-bench")))
 TEMPERATURE = 0  # benchmark 一律 greedy；两端点默认都在采样，必须显式锁 0
 
 # ---------------- 冻结模板（每数据集一个，对齐论文协议） ----------------
@@ -78,8 +92,11 @@ def build_prompt(ds: str, item: dict) -> str:
 
 def post(url: str, payload: dict, timeout: int = 90):
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=data,
-                                 headers={"content-type": "application/json"})
+    headers = {"content-type": "application/json"}
+    if VLLM_API_KEY:
+        headers["Authorization"] = "Bearer " + VLLM_API_KEY
+        headers["x-api-key"] = VLLM_API_KEY  # 双头发，兼容两种鉴权风格
+    req = urllib.request.Request(url, data=data, headers=headers)
     t0 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -125,7 +142,7 @@ def run_pathA(ds, item):
         }],
         "tool_choice": {"type": "tool", "name": "answer"},
     }
-    body, dt, err = post(f"{BASE_PROXY}/v1/messages", payload)
+    body, dt, err = post(f"{VLLM_BASE}/v1/messages", payload)
     if err:
         return {"pred": None, "err": err, "lat": dt, "out_tok": None, "raw": None}
     raw = None
@@ -158,7 +175,7 @@ def run_pathB(ds, item):
             },
         },
     }
-    body, dt, err = post(f"{BASE_PROXY}/v1/chat/completions", payload)
+    body, dt, err = post(f"{VLLM_BASE}/v1/chat/completions", payload)
     if err:
         return {"pred": None, "err": err, "lat": dt, "out_tok": None, "raw": None}
     txt = body["choices"][0]["message"].get("content", "")
@@ -177,7 +194,7 @@ def run_pathC(ds, item):
         "temperature": TEMPERATURE,
         "messages": [{"role": "user", "content": build_prompt(ds, item)}],
     }
-    body, dt, err = post(f"{BASE_PROXY}/v1/chat/completions", payload)
+    body, dt, err = post(f"{VLLM_BASE}/v1/chat/completions", payload)
     if err:
         return {"pred": None, "err": err, "lat": dt, "out_tok": None, "raw": None}
     txt = body["choices"][0]["message"].get("content", "").strip()
