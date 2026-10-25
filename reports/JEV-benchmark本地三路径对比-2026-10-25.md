@@ -27,6 +27,17 @@
 - harness 已修（`scripts/jev_bench_run.py`：显式 temperature=0 + bijective base-26 标签 + 大小写敏感精确评分）。banking77 用新标签（AA/AB…BY）重跑后与本节旧标签口径不可直接比，以新跑为准。
 - 下文第 3 节 Banking77 行、第 4 节发现 2、第 5 节相关结论**按本节作废/修正**。
 
+深挖 filler/思考实验时又发现**三个工程层 bug**（2026-10-25 23:30 追加，同样以本节为准）：
+
+3. **预填充探针 v1 的"崩盘"是传输错误假象**：v1 报 F0 75.0% → F1 65.0% → F2 65.0% → F3 57.5%，看似 filler token 单调毁准确率。逐题核查：**所有"解析失败"都是 HTTP 502 `upstream connect failed: connection timed out`**——两个 benchmark 并发打服务器 + harness 的 urllib 走 Mac 系统代理（127.0.0.1:51647）时的传输层失败，与模型无关。只看真正拿到答案的题：**F0 83.3%（30/36）→ F1 81.3%（26/32）→ F2 81.3% → F3 79.3%（23/29）**，差异在噪声内——没有任何 filler 配置有效的证据，也没有"崩盘"。
+4. **F1/F2 剂量扫描失效（tokenizer 把点串合并）**：v1 用 `"."*16` / `"."*64`，Qwen BPE 把点串合并成 ~2 token，两配置 in_tok 完全相同（1067 vs 1067），"剂量翻 4 倍"从未发生，F1=F2 是必然结果。v2 改用量词化 1:1 的 `"hmm "` 重复（8/64 token）+ 512 点串 + 复述，共 5 配置。
+5. **DSH 侧 4 新数据集首跑丢原始数据**：`json.dump({...}, ensure_ascii=False)` 漏传文件句柄，240 题跑完（952s）才在保存时崩溃。汇总数字幸存于 `run2_pathA.log`（hellaswag 85.0 / mathqa 48.3 / truthfulqa 71.7 / imdb 78.3），逐题原始记录丢失；已用修好的 harness 直连服务器重跑补原始数据（进行中）。
+
+** harness 通用修复（两个脚本都改了）**：`post()` 加退避重试（4xx 不重试，5xx/超时重试 3 次）+ 绕过系统代理（`ProxyHandler({})`，顺带每请求省 ~2.5s）+ 汇总把 `transport_err` 与 `parse_fail` 分开报。**教训复读：benchmark 报"解析失败"前先看错误串，传输层故障会伪装成模型不会答题。**
+
+6. **C4 第一版作废（两个 bug 叠乘）**：① vLLM 的 `prompt_logprobs` dict 的 key 是 **token ID 字符串**（"271"）不是 token 文本，旧代码取 key 当"第一念"，永远对不上字母；② 更根本的——chat 模板让最后 prompt 位置的 top1 恒为 `\n\n`（logprob=0.0，确定性），答案字母 `' A'` 在 rank 4，"全局 argmax"根本不是答案。正确做法（论文协议）：**只在选项字母 token 集合内重归一化**再取 argmax。另发现 8787 代理会剥掉 `prompt_logprobs`（请求体重建时丢失），C4 必须直连服务器。第一版 60 题只回来 19 题（41 个 err），其中"instinct-alone acc 41/60"还是汇总 bug——失败记录的 instinct 和 gold 都是 None，`None==None` 被算成命中，真实第一念命中 **0/19**。
+7. **服务器崩溃事故（00:10-00:20，已自动恢复）**：排查 C5（论文协议 raw-completion 复刻）时给 `/v1/completions` 传 `prompt_logprobs`/`logprobs` 参数，**该 fork 的这个组合会挂死 TP worker**——shm_broadcast 看门狗超时（TimeoutError）→ EngineCore 死亡 → 级联 500 → 容器重启（Docker restart policy，~8 分钟恢复）。崩溃现场调度器状态 `prompt_len=5` 正是测试句 "The capital of France is"。**这是要提给 1Cat 的 fork bug**；同时 C5 路线在此 fork 上被堵死，论文口径改由 C4 的选项内重归一化近似。附带发现：事故期间服务器上还有另一路 ~1 req/s 的 `/v1/messages` 流量（疑似 DSH/agent 循环），与我的实验争抢加重了慢请求。
+
 ---
 
 ## 1. JEV 是什么（网络检索结论）
@@ -51,6 +62,25 @@
 三路径**同题、同模板、同模型**。题量与模板：MMLU 150 题（知识）、ARC-Challenge 60（科学常识）、SST-2 60（情感二分类）、AG News 60（主题四分类）、Banking77 60（意图 **77 分类**，大 enum 分水岭）。共 390 题/路径，并发 6。
 
 ## 3. 成绩总表
+
+### 3.0 Path A 九数据集全表（2026-10-25 深夜扩展，新 4 集为直连干净重跑）
+
+| 数据集 | n | A 本地 skill | 解析失败 | 传输错误 | 平均延迟(s) | 平均输出 token |
+|---|---|---|---|---|---|---|
+| mmlu | 150 | 68.7% | 2 | — | 17.15 | 9.8 |
+| arc | 60 | 95.0% | 0 | — | 6.23 | 11.2 |
+| sst2 | 60 | 98.3% | 0 | — | 4.72 | 11.2 |
+| agnews | 60 | 78.3% | 0 | — | 3.57 | 11.6 |
+| banking77 | 60 | 76.7% | 0 | — | 3.96 | 7.1 |
+| hellaswag | 60 | **86.7%** | 0 | 0 | 19.66 | 7.2 |
+| mathqa | 60 | **50.0%** | 0 | 0 | 14.81 | 11.1 |
+| truthfulqa | 60 | **78.3%** | 0 | 0 | 16.24 | 11.2 |
+| imdb | 60 | **91.7%** | 0 | 0 | 26.00 | 12.0 |
+| **合计** | **630** | **78.7%** | 2 | — | — | — |
+
+- 新 4 集首跑（经 8787）报的 85.0/48.3/71.7/78.3 + 18 个"解析失败"全部作废：那 18 题经核查全是 HTTP 502 传输错误，直连+重试干净重跑后四集全涨（truthfulqa +6.6pp、imdb +13.4pp）、解析失败归零。原始数据：`results_1792943210.json`。
+- **mathqa 50.0% 是全表最低**——多步计算软肋，与 JEV 论文"决策模型计算项低 17.7pp"同向；语义分类（imdb/sst2/banking77/agnews）与常识选择（arc/hellaswag）都在 77-98% 区间。
+- 完整口径与数据源说明见 `data/jev-bench/本地成绩表-PathA-qwen3.8-27b-w8a16-2026-10-25.md`。
 
 ### 准确率（%）
 
@@ -109,3 +139,32 @@ python3 scripts/jev_bench_run.py --concurrency 6
 - `dsh-structured-output` 新增 **`bench_mc` 形状**：JEV 式多选决策——题目+选项写在 prompt，返回 `{"choice":"B","confidence":0.82}`。派发方式：`model: qwen3.8-27b-w8a16__schema=bench_mc`（已 commit bb43e7d 推送 GitHub）。
 - **修复一个真 bug**：注册表原是"进程启动时读一次 agents.json"的缓存，导致加新形状被挡（实测 `bench_mc` 请求被透传成自由文本）。已改为 **mtime 热加载**（每请求 stat，变了才重读），改 `agents.json` 即生效。旧实例需重启一次加载新代码。
 - 待办：重启 8787 代理实例让 `bench_mc` + 热加载在线上生效（benchmark 已跑完，现在重启安全）。
+
+## 8. 复现工程化（2026-10-25 深夜追加：直连发现 + GitHub 一键复现）
+
+- **直连发现（重要）**：实测 Path A 的强制工具调用**不需要任何代理**——直接 POST vLLM 服务器的 `/v1/messages`（带 `tools` + `tool_choice:{type:"tool"}`，正确 api-key 用 `Authorization: Bearer`）即返回干净 `tool_use` 块（HTTP 200，答案正确）。§5 里"A 延迟 3-7×"的账要改记：那 3-7× 是 8787 代理的 SSE 组装转发链成本，**不是结构化机制本身**。harness 已加环境变量（`VLLM_BASE`/`VLLM_API_KEY`/`VLLM_MODEL`/`BENCH_DIR`），可直连任意 vLLM。
+- **GitHub 仓库（PUBLIC）**：`dd2003-460/jev-structured-bench`，已做到**开箱即用**：
+  - `docker-compose.yml`（标准 vLLM 镜像，`.env` 里换 `MODEL` 即可换任何模型）+ `.env.example` + `scripts/reproduce.sh`（一键：下载评测集→三路径跑分→汇总）+ `requirements.txt`（纯标准库零依赖）
+  - `harness/prefill_thinking_probe.py`（新增）：filler-token"prefill 思考"实验 F0-F3（论文依据：Goyal 2023 pause tokens / Merrill&Sabharwal 2024 dot-by-dot / 2026 Reading Between the Dots）
+  - README 重写 Reproduce 章节：任何有 GPU + docker 的人 10 分钟跑通方法对比；诚实声明——具体数字依赖 4×V100+fork，可复现的是方法论与抓虫结论
+- **思考实验（本地跑，进行中）**：`scripts/thinking_probe.py` 五配置 C0-C4（纯结构化/+reason/全思考/两段式/prompt_logprobs 第一念），60 题锁温。首配置 C0 已出：acc 85.0%、avg_lat 14.8s、avg_out_tok 13、think_tok=0。
+
+## 9. 思考与 prefill 实验（2026-10-25 深夜，回答"开思考浪费 token 吗 / 能利用 prefill 思考吗"）
+
+### 9.1 前提发现：这个 fork 没有独立思考通道
+
+实测三种开法（`chat_template_kwargs.enable_thinking=true` / payload `thinking:{type:enabled}` / 默认不传）：`reasoning_content` 永远为空、`reasoning_tokens` 从不报告。不约束输出时模型把推理**直接写在 `content` 里**（问 17+25，默认配置产出 312 token 的 "Step 1… Step 2…"）。**推论：C2（schema + enable_thinking）实际退化成 C0**——schema 把输出锁成 10 token 的 JSON，推理被挤掉，这正是 C2 比 C0 还快（10.8s vs 14.8s）的原因。真正的"思考"只能靠 C1（低预算 CoT，inline）和 C3（两段式，phase 1 无约束）。
+
+### 9.2 思考实验（60 题 = banking77 30 + arc 30，锁温，走 8787）
+
+| 配置 | 机制 | 准确率 | 平均输出 token | 平均延迟 | 传输错误 |
+|---|---|---|---|---|---|
+| C0 | 纯结构化（json_schema 单 enum） | **85.0%**（51/60） | 13 | 14.8s | 0 |
+| C1 | +一句 reason（低预算 CoT） | 81.7%（49/60） | 86（×6.6） | 17.5s | 2 |
+| C2 | schema + enable_thinking | 83.3%（50/60） | 10 | 10.8s | 1 |
+
+**结论：低预算 CoT 在选择题上是三输**——多花 6.6× token、多等 18% 延迟、还掉 3.3pp（含 2 题 JSON 解析失败）。语法约束把推理挤掉后模型直接给答案，这点在 §4 发现 1 已经见过（A vs C 只差 3.1pp）。**对决策型任务，"想"这件事由结构化输出代劳了，不需要模型写字。**
+
+### 9.3 预填充 filler 实验（回答"有什么办法利用 prefill 过程思考"）
+
+论文线：Goyal 2023 pause tokens（要训练）/ Merrill&Sabharwal 2024 dot-by-dot（Llama-34M 合成任务 66%→100%，常规 QA 无益）/ 2026 Reading Between the Dots（DeepSeek V3/Kimi K2 确实在 filler 区做隐藏计算）。v1 结果因传输错误作废（见 §0 勘误 3/4），v2 重跑中（F0 基线 / F1 "hmm"×8 / F2 "hmm"×64 / F3 点串×512 / F4 问题复述）。v1 清洗后（只看拿到答案的题）无任何 filler 有效证据（83.3/81.3/81.3/79.3），且这些模型没有经过 pause-token 训练——**"免费思考"在本任务上不成立的预期先例充分**。

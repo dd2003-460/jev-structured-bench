@@ -13,13 +13,14 @@ Six configurations, same questions, same frozen template, temperature=0:
                                  position ("first instinct" after reading the question).
                                  Zero extra decode cost: the prefill forward pass already
                                  computed that distribution. Tests free selective-prediction.
-  C5  paper protocol           — JEV arXiv 2609.37647 口径的本地复刻：/v1/completions
-                                 （无 chat 模板）raw prompt 正好结束在答题位，
-                                 prompt_logprobs top-20，只在选项字母 token 内重归一化取
-                                 argmax。零额外 decode 成本。
+                                 （C5 原计划用 /v1/completions 复刻论文的 raw-completion 口径，
+                                 已放弃：该 fork 的 /v1/completions 带 logprobs 参数会挂死 TP
+                                 worker，触发 EngineCore 看门狗杀引擎——2026-10-25 00:10 实测
+                                 把服务器打崩重启过一次。论文口径改由 C4 的"选项内重归一化"
+                                 近似。）
 
 Metrics per config: accuracy, wall-clock, output tokens, thinking tokens (C2/C3 phase1),
-and (C4/C5) agreement between first-instinct argmax and the structured answer.
+and (C4) agreement between first-instinct argmax and the structured answer.
 
 C4 bug found 2026-10-25（第一版 C4 输出作废，已修）：
   1. vLLM 的 prompt_logprobs dict 的 **key 是 token ID 字符串**（"271"），不是 token 文本；
@@ -27,7 +28,8 @@ C4 bug found 2026-10-25（第一版 C4 输出作废，已修）：
   2. 更根本的：chat 模板让最后 prompt 位置的 top1 恒为 '\n\n'（logprob=0.0，确定性），
      答案字母 ' A' 在 rank 4——"全局 argmax"根本不是答案。论文协议的正确做法是
      **只在选项字母 token 集合内重归一化**再取 argmax。
-  3. top_logprobs=5 覆盖不全（ banking77 的 "BY" 等标签 token 排在很后面），改 top-20。
+  3. top_logprobs=5 覆盖不全（banking77 的 "BY" 等标签 token 排在很后面），改 top-20。
+  4. 8787 代理会剥掉 prompt_logprobs（请求体重建时丢失）——C4/C5 必须直连服务器。
 """
 import json
 import re
@@ -52,14 +54,30 @@ N_ARC = int(os.environ.get("N_ARC", "30"))
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "2"))
 
 
-def curl_post(url, payload, timeout=300):
-    r = subprocess.run(
-        ["curl", "-s", "--noproxy", "*", "--max-time", str(timeout),
-         "-X", "POST", url, "-H", "content-type: application/json",
-         *(["-H", f"Authorization: Bearer {API_KEY}"] if API_KEY else []),
-         "-d", json.dumps(payload)],
-        capture_output=True, text=True)
-    return r.stdout
+def curl_post(url, payload, timeout=300, retries=3):
+    """POST JSON；传输层失败（连接错误/5xx）退避重试，4xx 不重试。
+    2026-10-25 教训：服务器重启窗口内连接被拒，不重试就会把传输失败
+    误记成模型/机制错误（C4 第一版 41/60 的 err 大部分是这么来的）。"""
+    last = None
+    for attempt in range(retries):
+        r = subprocess.run(
+            ["curl", "-s", "--noproxy", "*", "--max-time", str(timeout),
+             "-X", "POST", url, "-H", "content-type: application/json",
+             *(["-H", f"Authorization: Bearer {API_KEY}"] if API_KEY else []),
+             "-d", json.dumps(payload)],
+            capture_output=True, text=True)
+        out = r.stdout.strip()
+        if out:
+            try:
+                return json.loads(out)
+            except json.JSONDecodeError:
+                last = f"非 JSON 响应: {out[:120]!r}"
+        else:
+            last = f"curl 退出码 {r.returncode}: {(r.stderr or '')[:120]!r}"
+        # HTTP 4xx 的响应体是合法 JSON 且已返回（上面 json.loads 会成功并带着 error 字段），
+        # 走到这里说明是传输层失败或空响应——退避后重试。
+        time.sleep(2 * (attempt + 1))
+    raise RuntimeError(last)
 
 
 def labels_for(n):
@@ -205,28 +223,11 @@ def run_one_cfg(cfg, item):
                        agree=(instinct is not None and instinct == extract_choice(raw, letters)),
                        out_tok=usage_of(j)[0], think_tok=usage_of(j)[2])
         elif cfg == "C5":
-            # JEV 论文口径本地复刻：raw completion（无 chat 模板），prompt 结束在答题位，
-            # 最后位置 top-20 logprobs，选项字母 token 内重归一化取 argmax。
-            raw_prompt = (prompt + "\n\nAnswer: ")
-            body = curl_post(f"{BASE}/v1/completions", {
-                "model": MODEL, "max_tokens": 1, "temperature": 0,
-                "prompt": raw_prompt, "prompt_logprobs": 20})
-            j = json.loads(body)
-            lp = j.get("prompt_logprobs") or []
-            instinct, covered, top1_tok = None, 0, None
-            if lp:
-                last = lp[-1] or {}
-                best = max(last.items(), key=lambda kv: kv[1].get("logprob", -99)
-                           if isinstance(kv[1], dict) else -99)
-                top1_tok = (best[1] or {}).get("decoded_token") if isinstance(best[1], dict) else best[0]
-                cands = [(v.get("logprob", -99), (v.get("decoded_token") or "").strip())
-                         for v in last.values()
-                         if isinstance(v, dict) and (v.get("decoded_token") or "").strip() in letters]
-                covered = len(cands)
-                if cands:
-                    instinct = max(cands)[1]
-            rec.update(instinct=instinct, labels_in_top20=covered,
-                       top1_tok=repr(top1_tok), out_tok=1, think_tok=0)
+            # 【已废弃】原计划：/v1/completions raw prompt 复刻论文口径。
+            # 2026-10-25 00:10 实测：该 fork 的 /v1/completions 带 prompt_logprobs/logprobs
+            # 参数会挂死 TP worker（shm_broadcast 看门狗超时 → EngineCore 死亡 → 容器重启）。
+            # 论文口径改由 C4 的"选项字母 token 内重归一化"近似（见 docstring）。
+            raise RuntimeError("C5 已废弃：/v1/completions+logprobs 会挂死该 fork 的 worker")
         rec["lat"] = round(time.time() - t0, 2)
         rec["gold"] = letters[item["answer"]]
         rec["ok"] = (rec.get("pred") == rec["gold"])
@@ -241,7 +242,7 @@ def rec_pred_check(raw, letters):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--configs", nargs="*", default=["C0", "C1", "C2", "C3", "C4", "C5"])
+    ap.add_argument("--configs", nargs="*", default=["C0", "C1", "C2", "C3", "C4"])
     args = ap.parse_args()
     items = []
     for ds, n in (("banking77", N_BANK), ("arc", N_ARC)):
@@ -252,7 +253,7 @@ def main():
     cfgs = args.configs
     # 部分配置跑时单独存文件，避免覆盖全量结果（C4 第一版有 bug，重跑不能抹掉 C0-C3）
     global OUT
-    if sorted(cfgs) != sorted(["C0", "C1", "C2", "C3", "C4", "C5"]):
+    if sorted(cfgs) != sorted(["C0", "C1", "C2", "C3", "C4"]):
         OUT = f"{BENCH}/thinking_probe_{'_'.join(cfgs)}.json"
     results = {}
     for cfg in cfgs:
@@ -271,15 +272,17 @@ def main():
               f"err={err} wall={time.time()-t0:.0f}s "
               f"avg_lat={sum(lats)/len(lats):.1f}s avg_out_tok={sum(toks)/len(toks):.0f} "
               f"avg_think_tok={sum(thk)/len(thk):.0f}", flush=True)
-        if cfg in ("C4", "C5"):
+        if cfg == "C4":
             ag = sum(1 for r in rs if r.get("agree"))
             has = sum(1 for r in rs if r.get("instinct"))
-            ok_inst = sum(1 for r in rs if r.get("instinct") == r.get("gold"))
-            cov = [r.get("labels_in_top20") or 0 for r in rs]
-            print(f"  {cfg} instinct: present {has}/{len(rs)}, agree-with-structured {ag}, "
-                  f"instinct-alone acc {ok_inst}/{len(rs)} "
-                  f"({ok_inst/len(rs)*100:.1f}%), labels_in_top20 avg {sum(cov)/len(cov):.1f}",
-                  flush=True)
+            # 注意：必须要求 instinct 非 None——错误记录的 instinct 和 gold 都是 None，
+            # None==None 会把传输失败算成"第一念命中"（第一版就这么虚报了 41/60）。
+            ok_inst = sum(1 for r in rs
+                          if r.get("instinct") is not None and r.get("instinct") == r.get("gold"))
+            n_ans = sum(1 for r in rs if not r.get("error"))
+            print(f"  C4 instinct: present {has}/{len(rs)} (answered {n_ans}), "
+                  f"agree-with-structured {ag}, instinct-alone acc {ok_inst}/{has} "
+                  f"({ok_inst/has*100:.1f}% of present)", flush=True)
         if cfg == "C3":
             agree13 = sum(1 for r in rs if r.get("phase1_letter") and
                           r.get("phase1_letter") == r.get("pred"))
